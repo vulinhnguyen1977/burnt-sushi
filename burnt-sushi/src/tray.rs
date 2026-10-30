@@ -6,17 +6,21 @@ use std::{
 use native_windows_derive as nwd;
 use native_windows_gui as nwg;
 
-use log::error;
+use log::{error, info};
 use nwd::NwgUi;
 use nwg::NativeUi;
+use widestring::U16CString;
 use windows_sys::Win32::{
     System::Threading::GetCurrentThreadId,
-    UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT},
+    UI::WindowsAndMessaging::{
+        MF_BYCOMMAND, MF_STRING, ModifyMenuW, PostThreadMessageW, WM_QUIT,
+    },
 };
 
 use crate::{
     APP_NAME,
     logger::{self, Console},
+    stats::{self, BlockedCounts},
 };
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -97,6 +101,10 @@ pub struct SystemTrayIcon {
     #[nwg_control(parent: window, popup: true)]
     tray_menu: nwg::Menu,
 
+    #[nwg_control(parent: tray_menu, text: "Requests blocked: 0")]
+    #[nwg_events(OnMenuItemSelected: [SystemTrayIcon::report_blocked])]
+    tray_item_blocked: nwg::MenuItem,
+
     #[nwg_control(parent: tray_menu, text: "Show Console")]
     #[nwg_events(OnMenuItemSelected: [SystemTrayIcon::show_console])]
     tray_item2: nwg::MenuItem,
@@ -115,11 +123,50 @@ impl SystemTrayIcon {
     fn show_menu(&self) {
         let (x, y) = nwg::GlobalCursor::position();
 
+        let counts = stats::blocked_counts();
+        self.set_blocked_label(counts);
+        self.tray
+            .set_tip(&format!("{APP_NAME} - {} requests blocked", counts.total()));
+
         // Ends the statement holding the lock, so it is released before the menu opens.
         let has_console = logger::global::get().has_active_console();
         self.tray_item2.set_enabled(!has_console);
 
         self.tray_menu.popup(x, y);
+    }
+
+    /// Rewrites the label of the counter item, which `nwg` cannot do once it is built.
+    fn set_blocked_label(&self, counts: BlockedCounts) {
+        let Some((menu, id)) = self.tray_item_blocked.handle.hmenu_item() else {
+            return;
+        };
+        let Ok(text) = U16CString::from_str(format!("Requests blocked: {}", counts.total())) else {
+            return;
+        };
+
+        // Passing the existing id back keeps the item wired to its click handler.
+        unsafe {
+            ModifyMenuW(
+                menu.cast(),
+                id,
+                MF_BYCOMMAND | MF_STRING,
+                id as usize,
+                text.as_ptr(),
+            )
+        };
+    }
+
+    fn report_blocked(&self) {
+        let counts = stats::blocked_counts();
+        let message = format!(
+            "Blocked {} requests since startup ({} hostnames, {} urls).",
+            counts.total(),
+            counts.hosts,
+            counts.urls
+        );
+
+        info!("{message}");
+        self.tray.show(&message, Some(APP_NAME), None, None);
     }
 
     fn show_console(&self) {
